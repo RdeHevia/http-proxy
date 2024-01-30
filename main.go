@@ -32,32 +32,21 @@ func printMessage(id string, buffer []byte) {
 	print(id, message)
 }
 
-/*
-ALGO:
-- Listen por incoming connections TCP
-- If TCP connection: Start a go routine
-	- -> Accept
-	- read the content (multiple packets?)
-	- open TCP connection with backend
-	- send data
-	-
-------
-CONSTANTS:
-TCP_PORT=1234
-ENDPOINT_HOST=localhost
-ENPOINT_PORT=1234
-*/
-
-func forwardRequest(id string, clientConnection net.Conn, serverConnection net.Conn) {
+func forwardRequest(id string, clientConnection net.Conn, serverConnection net.Conn) error {
 	client := "client"
 	proxyAddress := clientConnection.RemoteAddr()
 	remoteServerAddress := serverConnection.RemoteAddr()
 
 	requestData := make([]byte, 1500)
-	bytesRequest, _ := clientConnection.Read(requestData)
+	bytesRequest, err := clientConnection.Read(requestData)
+	if err != nil && err.Error() != "EOF" {
+		print(id, err.Error())
+		return err
+	}
+
 	if bytesRequest == 0 {
 		print(id, "Empty HTTP request received from the client")
-		return
+		return nil
 	}
 
 	// printMessage(id, requestData)
@@ -66,11 +55,13 @@ func forwardRequest(id string, clientConnection net.Conn, serverConnection net.C
 
 	print(id, "%v ==> %v ... %v ; %vB", client, proxyAddress, remoteServerAddress, bytesRequest)
 
-	serverConnection.Write(requestData)
+	_, err = serverConnection.Write(requestData[:bytesRequest])
 	print(id, "%v ... %v ==> %v ; %vB", client, proxyAddress, remoteServerAddress, bytesRequest)
+
+	return err
 }
 
-func forwardResponse(id string, clientConnection net.Conn, serverConnection net.Conn) {
+func forwardResponse(id string, clientConnection net.Conn, serverConnection net.Conn) error {
 	client := "client"
 	proxyAddress := clientConnection.RemoteAddr()
 	remoteServerAddress := serverConnection.RemoteAddr()
@@ -81,24 +72,42 @@ func forwardResponse(id string, clientConnection net.Conn, serverConnection net.
 		print(id, " - response segment count: %v", segmentCount)
 
 		responseData := make([]byte, 1500)
-		bytesResponse, _ := serverConnection.Read(responseData)
+		bytesResponse, err := serverConnection.Read(responseData)
 
 		print(id, "%v ... %v <== %v ; %vB", client, proxyAddress, serverConnection.LocalAddr(), bytesResponse)
+
+		if err != nil && err.Error() != "EOF" {
+			print(id, err.Error())
+			return err
+		}
+
 		// printMessage(id, responseData)
+
+		if err != nil && err.Error() != "EOF" {
+			print(id, err.Error())
+			return err
+		}
 
 		if bytesResponse == 0 {
 			print(id, "Empty HTTP response received from the server")
 			serverConnection.Close()
 			print(id, "TCP connection with localhost:9000 closed")
-			break
+			return nil
 		}
 
-		clientConnection.Write(responseData[:bytesResponse])
+		_, err = clientConnection.Write(responseData[:bytesResponse])
 		print(id, "%v <== %v ... %v ; %vB", client, proxyAddress, remoteServerAddress, bytesResponse)
+
+		if err != nil && err.Error() != "EOF" {
+			print(id, err.Error())
+			return err
+		}
 
 		segmentCount++
 		// time.Sleep(1 * time.Second) // RdH todo delete
 	}
+
+	return nil
 }
 
 func proxy(id string, clientConnection net.Conn) {
