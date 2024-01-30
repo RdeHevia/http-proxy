@@ -110,12 +110,19 @@ func forwardResponse(id string, clientConnection net.Conn, serverConnection net.
 	return nil
 }
 
-func proxy(id string, clientConnection net.Conn) {
+func proxy(id string, clientConnection net.Conn) error {
 	// Open connection with remote server
-	serverConnection, _ := net.Dial("tcp", SERVER_ENDPOINT)
+	serverConnection, err := net.Dial("tcp", SERVER_ENDPOINT)
+	if err != nil {
+		log.Println(err)
+		clientConnection.Close()
+		return err
+	}
 
 	forwardRequest(id, clientConnection, serverConnection)
 	forwardResponse(id, clientConnection, serverConnection)
+
+	return nil
 }
 
 func main() {
