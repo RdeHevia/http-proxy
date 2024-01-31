@@ -8,10 +8,23 @@ import (
 	"net"
 )
 
+type Request struct {
+	id             string
+	connectionId   string
+	requestLine    string
+	headers        map[string]string
+	lengthBodyRead int
+}
+
 const (
 	PROXY_ENDPOINT  = ":1234"
 	SERVER_ENDPOINT = "localhost:9000"
 )
+
+func parseHTTP(id string, buffer []byte, bytesCount int) {
+	text := string(buffer[:bytesCount])
+	print(id, text)
+}
 
 func GenerateRandomString(length int) (string, error) {
 	str := make([]byte, length/2)
@@ -39,6 +52,8 @@ func forwardRequest(id string, clientConnection net.Conn, serverConnection net.C
 
 	requestData := make([]byte, 1500)
 	bytesRequest, err := clientConnection.Read(requestData)
+	parseHTTP(id, requestData, bytesRequest)
+
 	if err != nil && err.Error() != "EOF" {
 		print(id, err.Error())
 		return err
@@ -61,6 +76,57 @@ func forwardRequest(id string, clientConnection net.Conn, serverConnection net.C
 	return err
 }
 
+/*
+DATA STRUCTURE:
+
+request {
+	id string
+	connectionId string
+	requestLine: "GET / HTTP/1.1 200"
+	headers: map
+	contentLength int
+	bytesReceivedAfterHeader int
+}
+ALGO exit loop:
+- read response -> number of bytes
+- try to parse headers
+	- yes:
+		- if requestLine exist -> initate request object
+		-	record contentLength
+		- if contentLength == 0 -> return
+		- if contentLength > 0
+	- no:
+		- if bytes < contentLength:
+			- bytesReceivedAfterHeader += bytes
+		- if bytes >= contentLength:
+			- close connection with server
+----------------
+- read response -> number of bytes
+- done, err := processHTTPResponse
+- if done -> exit loop
+*/
+
+func processHTTPResponseFromServer(id string, serverConnection net.Conn, client string, proxyAddress net.Addr) (responseData []byte, done bool, err error) {
+	responseData = make([]byte, 1500)
+	bytesResponse, err := serverConnection.Read(responseData)
+	parseHTTP(id, responseData, bytesResponse)
+
+	print(id, "%v ... %v <== %v ; %vB", client, proxyAddress, serverConnection.LocalAddr(), bytesResponse)
+
+	if err != nil && err.Error() != "EOF" {
+		print(id, err.Error())
+		return nil, false, err
+	}
+
+	// printMessage(id, responseData)
+
+	if bytesResponse == 0 {
+		return responseData[:bytesResponse], true, nil
+	}
+
+	return responseData[:bytesResponse], false, nil
+}
+
 func forwardResponse(id string, clientConnection net.Conn, serverConnection net.Conn) error {
 	client := "client"
 	proxyAddress := clientConnection.RemoteAddr()
@@ -71,31 +137,16 @@ func forwardResponse(id string, clientConnection net.Conn, serverConnection net.
 	for {
 		print(id, " - response segment count: %v", segmentCount)
 
-		responseData := make([]byte, 1500)
-		bytesResponse, err := serverConnection.Read(responseData)
+		responseData, done, err := processHTTPResponseFromServer(id, serverConnection, client, proxyAddress)
 
-		print(id, "%v ... %v <== %v ; %vB", client, proxyAddress, serverConnection.LocalAddr(), bytesResponse)
-
-		if err != nil && err.Error() != "EOF" {
+		if err != nil {
 			print(id, err.Error())
-			return err
-		}
-
-		// printMessage(id, responseData)
-
-		if err != nil && err.Error() != "EOF" {
-			print(id, err.Error())
-			return err
-		}
-
-		if bytesResponse == 0 {
-			print(id, "Empty HTTP response received from the server")
 			serverConnection.Close()
-			print(id, "TCP connection with localhost:9000 closed")
-			return nil
+			clientConnection.Close()
+			return err
 		}
 
-		_, err = clientConnection.Write(responseData[:bytesResponse])
+		bytesResponse, err := clientConnection.Write(responseData)
 		print(id, "%v <== %v ... %v ; %vB", client, proxyAddress, remoteServerAddress, bytesResponse)
 
 		if err != nil && err.Error() != "EOF" {
@@ -103,11 +154,16 @@ func forwardResponse(id string, clientConnection net.Conn, serverConnection net.
 			return err
 		}
 
+		if done {
+			print(id, "Empty HTTP response received from the server")
+			serverConnection.Close()
+			print(id, "TCP connection with localhost:9000 closed")
+			return nil
+		}
+
 		segmentCount++
 		// time.Sleep(1 * time.Second) // RdH todo delete
 	}
-
-	return nil
 }
 
 func proxy(id string, clientConnection net.Conn) error {
@@ -120,7 +176,9 @@ func proxy(id string, clientConnection net.Conn) error {
 	}
 
 	forwardRequest(id, clientConnection, serverConnection)
+	print(id, "rdh after forward request")
 	forwardResponse(id, clientConnection, serverConnection)
+	print(id, "rdh after forward response")
 
 	return nil
 }
@@ -143,6 +201,8 @@ func main() {
 			continue
 		}
 
-		go proxy(id, connection)
+		// go proxy(id, connection)
+		proxy(id, connection)
+		print(id, "rdh after proxy")
 	}
 }
