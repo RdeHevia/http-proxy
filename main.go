@@ -3,17 +3,20 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"strconv"
+	"strings"
 )
 
-type Request struct {
-	id             string
-	connectionId   string
-	requestLine    string
-	headers        map[string]string
-	lengthBodyRead int
+type MessageTracker struct {
+	Id             string
+	ConnectionId   string
+	RequestLine    string
+	Headers        map[string]string
+	LengthBodyRead int
 }
 
 const (
@@ -21,9 +24,86 @@ const (
 	SERVER_ENDPOINT = "localhost:9000"
 )
 
-func parseHTTP(id string, buffer []byte, bytesCount int) {
-	text := string(buffer[:bytesCount])
-	print(id, text)
+// func logStruct(v any) {
+// 	json, _ := json.MarshalIndent(v, "", "  ")
+// 	log.Printf("%+v\n", string(json))
+// }
+
+// func parseHTTP(id string, buffer []byte, bytesCount int) { // RdH: TODO refactor
+// 	text := string(buffer[:bytesCount])
+// 	print(id, text)
+// }
+
+func print(connectionId string, messageRaw string, v ...any) {
+	message := fmt.Sprintf(messageRaw, v...)
+	log.Printf("%v - %v", connectionId, message)
+}
+
+func printMessage(connectionId string, buffer []byte) {
+	message := string(buffer)
+	print(connectionId, message)
+}
+
+func printStruct(connectionId string, v any) {
+	json, _ := json.MarshalIndent(v, "", "  ")
+	log.Printf("%v: %+v\n", connectionId, string(json))
+}
+
+/*
+Assume message is either:
+- Headers + body1; body2... bodyN
+- all Headers; body1, body2... bodyN
+-------
+ALGO:
+Split "\r\n\r\n"
+- if len == 0 -> empty message -> return
+- if len == 1 && ! tracker.Headers -> it's the Headers
+	- parseHeaders and add them to the tracker
+- if len ==1 && tracker.Headers -> it's the body
+	- tracker.readBody += byteCount
+- if len == 2 -> it's the Headers and body1
+	- parseHeaders and add them to the tracker
+	- tracker.readBody += byteCount
+
+
+*/
+
+func parseHeaders(headersRaw string, tracker *MessageTracker) {
+	for _, line := range strings.Split(headersRaw, "\n") {
+		keyAndVal := strings.Split(strings.TrimSpace(line), ": ")
+		if len(keyAndVal) == 0 {
+			return
+		}
+
+		if len(keyAndVal) == 1 {
+			tracker.RequestLine = keyAndVal[0]
+		} else {
+			headerName := keyAndVal[0]
+			headerValue := keyAndVal[1]
+			tracker.Headers[headerName] = headerValue
+		}
+	}
+}
+
+func parseMessage(data []byte, bytesCount int, tracker *MessageTracker) (err error) {
+	text := string(data[:bytesCount])
+	print(tracker.ConnectionId, "rdh parseMessage:")
+	// print(tracker.connectionId, text)
+	sections := strings.Split(text, "\r\n\r\n")
+	log.Println("rdh sections length", len(sections))
+	if len(sections) == 0 {
+		return nil
+	} else if len(sections) == 1 && len(tracker.Headers) == 0 {
+		parseHeaders(sections[0], tracker)
+	} else if len(sections) == 1 && len(tracker.Headers) > 0 {
+		body := sections[0]
+		tracker.LengthBodyRead += len([]byte(body))
+	} else {
+		parseHeaders(sections[0], tracker)
+		tracker.LengthBodyRead += len([]byte(sections[1]))
+	}
+
+	return nil
 }
 
 func GenerateRandomString(length int) (string, error) {
@@ -35,129 +115,118 @@ func GenerateRandomString(length int) (string, error) {
 	return hex.EncodeToString(str), nil
 }
 
-func print(id string, messageRaw string, v ...any) {
-	message := fmt.Sprintf(messageRaw, v...)
-	log.Printf("%v - %v", id, message)
-}
-
-func printMessage(id string, buffer []byte) {
-	message := string(buffer)
-	print(id, message)
-}
-
-func forwardRequest(id string, clientConnection net.Conn, serverConnection net.Conn) error {
+func forwardRequest(connectionId string, clientConnection net.Conn, upstreamConnection net.Conn) (empty bool, err error) {
 	client := "client"
 	proxyAddress := clientConnection.RemoteAddr()
-	remoteServerAddress := serverConnection.RemoteAddr()
+	remoteServerAddress := upstreamConnection.RemoteAddr()
 
 	requestData := make([]byte, 1500)
-	bytesRequest, err := clientConnection.Read(requestData)
-	parseHTTP(id, requestData, bytesRequest)
+	requestByteCount, err := clientConnection.Read(requestData)
+	// parseHTTP(connectionId, requestData, requestByteCount)
+	printMessage(connectionId, requestData)
 
 	if err != nil && err.Error() != "EOF" {
-		print(id, err.Error())
-		return err
+		print(connectionId, err.Error())
+		return false, err
 	}
 
-	if bytesRequest == 0 {
-		print(id, "Empty HTTP request received from the client")
-		return nil
+	if requestByteCount == 0 {
+		print(connectionId, "Empty HTTP request received from the client")
+		return true, nil
 	}
 
-	// printMessage(id, requestData)
+	// printMessage(connectionId, requestData)
 
 	// Open connection with remote server and forward request
 
-	print(id, "%v ==> %v ... %v ; %vB", client, proxyAddress, remoteServerAddress, bytesRequest)
+	print(connectionId, "%v ==> %v ... %v ; %vB", client, proxyAddress, remoteServerAddress, requestByteCount)
 
-	_, err = serverConnection.Write(requestData[:bytesRequest])
-	print(id, "%v ... %v ==> %v ; %vB", client, proxyAddress, remoteServerAddress, bytesRequest)
+	_, err = upstreamConnection.Write(requestData[:requestByteCount])
+	print(connectionId, "%v ... %v ==> %v ; %vB", client, proxyAddress, remoteServerAddress, requestByteCount)
 
-	return err
+	return false, err
 }
 
-/*
-DATA STRUCTURE:
+func processResponseFromUpstream(responseTracker *MessageTracker, upstreamConnection net.Conn, client string, proxyAddress net.Addr) (data []byte, done bool, err error) {
+	data = make([]byte, 1500)
+	byteCount, err := upstreamConnection.Read(data)
 
-request {
-	id string
-	connectionId string
-	requestLine: "GET / HTTP/1.1 200"
-	headers: map
-	contentLength int
-	bytesReceivedAfterHeader int
-}
-ALGO exit loop:
-- read response -> number of bytes
-- try to parse headers
-	- yes:
-		- if requestLine exist -> initate request object
-		-	record contentLength
-		- if contentLength == 0 -> return
-		- if contentLength > 0
-	- no:
-		- if bytes < contentLength:
-			- bytesReceivedAfterHeader += bytes
-		- if bytes >= contentLength:
-			- close connection with server
-----------------
-- read response -> number of bytes
-- done, err := processHTTPResponse
-- if done -> exit loop
-*/
-
-func processHTTPResponseFromServer(id string, serverConnection net.Conn, client string, proxyAddress net.Addr) (responseData []byte, done bool, err error) {
-	responseData = make([]byte, 1500)
-	bytesResponse, err := serverConnection.Read(responseData)
-	parseHTTP(id, responseData, bytesResponse)
-
-	print(id, "%v ... %v <== %v ; %vB", client, proxyAddress, serverConnection.LocalAddr(), bytesResponse)
-
-	if err != nil && err.Error() != "EOF" {
-		print(id, err.Error())
+	if err != nil {
 		return nil, false, err
 	}
 
-	// printMessage(id, responseData)
+	print(responseTracker.ConnectionId, "%v ... %v <== %v ; %vB", client, proxyAddress, upstreamConnection.LocalAddr(), byteCount)
 
-	if bytesResponse == 0 {
-		return responseData[:bytesResponse], true, nil
+	err = parseMessage(data, byteCount, responseTracker)
+
+	if err != nil {
+		return data[:byteCount], false, err
 	}
 
-	return responseData[:bytesResponse], false, nil
+	contentLengthStr, ok := responseTracker.Headers["Content-Length"]
+	if !ok {
+		return data[:byteCount], false, nil
+	}
+
+	contentLength, err := strconv.Atoi(contentLengthStr)
+
+	if err != nil {
+		return data[:byteCount], false, err
+	}
+
+	if responseTracker.LengthBodyRead < contentLength {
+		return data[:byteCount], false, nil
+	}
+
+	return data[:byteCount], true, nil
 }
 
-func forwardResponse(id string, clientConnection net.Conn, serverConnection net.Conn) error {
+func forwardResponse(connectionId string, clientConnection net.Conn, upstreamConnection net.Conn) error {
 	client := "client"
 	proxyAddress := clientConnection.RemoteAddr()
-	remoteServerAddress := serverConnection.RemoteAddr()
+	remoteServerAddress := upstreamConnection.RemoteAddr()
+
+	responseId, err := GenerateRandomString(5)
+	if err != nil {
+		return err
+	}
+
+	responseTracker := MessageTracker{
+		Id:             responseId,
+		ConnectionId:   connectionId,
+		RequestLine:    "",
+		Headers:        map[string]string{},
+		LengthBodyRead: 0,
+	}
 
 	// Receive segments from remote server and forward them to client until done
 	segmentCount := 0
 	for {
-		print(id, " - response segment count: %v", segmentCount)
+		print(connectionId, " - response segment count: %v", segmentCount)
 
-		responseData, done, err := processHTTPResponseFromServer(id, serverConnection, client, proxyAddress)
+		responseData, done, err := processResponseFromUpstream(&responseTracker, upstreamConnection, client, proxyAddress)
+
+		printStruct(connectionId, responseTracker)
 
 		if err != nil {
-			print(id, err.Error())
-			serverConnection.Close()
+			print(connectionId, err.Error())
+			upstreamConnection.Close()
 			clientConnection.Close()
 			return err
 		}
 
-		bytesResponse, err := clientConnection.Write(responseData)
-		print(id, "%v <== %v ... %v ; %vB", client, proxyAddress, remoteServerAddress, bytesResponse)
+		responseByteCount, err := clientConnection.Write(responseData)
+		print(connectionId, "%v <== %v ... %v ; %vB", client, proxyAddress, remoteServerAddress, responseByteCount)
 
 		if err != nil && err.Error() != "EOF" {
-			print(id, err.Error())
+			print(connectionId, err.Error())
 			return err
 		}
 
 		if done {
-			print(id, "Empty HTTP response received from the server")
-			serverConnection.Close()
-			print(id, "TCP connection with localhost:9000 closed")
+			print(connectionId, "The request %v has been completely received", responseTracker.Id)
+			upstreamConnection.Close()
+			print(connectionId, "TCP connection with upstream server closed")
 			return nil
 		}
 
@@ -166,21 +235,55 @@ func forwardResponse(id string, clientConnection net.Conn, serverConnection net.
 	}
 }
 
-func proxy(id string, clientConnection net.Conn) error {
+func proxySS(connectionId string, clientConnection net.Conn) error {
 	// Open connection with remote server
-	serverConnection, err := net.Dial("tcp", SERVER_ENDPOINT)
+	upstreamConnection, err := net.Dial("tcp", SERVER_ENDPOINT)
 	if err != nil {
 		log.Println(err)
 		clientConnection.Close()
 		return err
 	}
 
-	forwardRequest(id, clientConnection, serverConnection)
-	print(id, "rdh after forward request")
-	forwardResponse(id, clientConnection, serverConnection)
-	print(id, "rdh after forward response")
+	forwardRequest(connectionId, clientConnection, upstreamConnection)
+	print(connectionId, "rdh after forward request")
+	forwardResponse(connectionId, clientConnection, upstreamConnection)
+	print(connectionId, "rdh after forward response")
 
 	return nil
+}
+
+/*
+Proxy algo:
+Loop:
+- open connection with upstream server
+- empty := forwardRequest
+- if empty -> break loop
+- if not empty -> continue
+*/
+
+func proxy(connectionId string, clientConnection net.Conn) error {
+	// Open connection with remote server
+
+	for {
+		upstreamConnection, err := net.Dial("tcp", SERVER_ENDPOINT)
+		print(connectionId, "Connection with upstream server opened")
+		if err != nil {
+			log.Println(err)
+			clientConnection.Close()
+			return err
+		}
+
+		empty, _ := forwardRequest(connectionId, clientConnection, upstreamConnection)
+		if empty {
+			upstreamConnection.Close()
+			return nil
+		}
+
+		forwardResponse(connectionId, clientConnection, upstreamConnection)
+		// upstreamConnection.Close() // RdH refactor so it doesn't close the connection inside forwardResponse. it should only be closed in here
+	}
+
+	// return nil
 }
 
 func main() {
@@ -193,16 +296,14 @@ func main() {
 
 	for {
 		connection, err := tcpListener.Accept()
-		id, _ := GenerateRandomString(5)
+		connectionId, _ := GenerateRandomString(5)
 
-		log.Printf("%v - TCP Connection accepted: %v", id, connection.RemoteAddr())
+		log.Printf("%v - TCP Connection accepted: %v", connectionId, connection.RemoteAddr())
 		if err != nil {
 			log.Println(err)
 			continue
 		}
 
-		// go proxy(id, connection)
-		proxy(id, connection)
-		print(id, "rdh after proxy")
+		go proxy(connectionId, connection)
 	}
 }
